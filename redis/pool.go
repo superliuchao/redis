@@ -1,0 +1,1091 @@
+package redis
+
+import (
+	"errors"
+	netURL "net/url"
+	"sync"
+	"time"
+	redigo "github.com/gomodule/redigo/redis"
+	"github.com/soveran/redisurl"
+)
+
+const Unlimited = 0
+
+var (
+	DefaultConfig = Config{
+		MaxOpenConnections: Unlimited,
+		MaxIdleConnections: 50,
+		IdleTimeout:        1 * time.Minute,
+		Wait:               true,
+	}
+
+	ErrPoolExhausted = errors.New("connection pool exhausted")
+
+	hostsNotUsingAuth = &hosts{hosts: map[string]bool{}}
+)
+
+// Thread safe
+type hosts struct {
+	mu    sync.RWMutex
+	hosts map[string]bool
+}
+
+func (m *hosts) Add(host string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hosts[host] = true
+}
+
+func (m *hosts) Remove(host string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.hosts, host)
+}
+
+func (m *hosts) Get(host string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hosts[host]
+}
+
+func generateConnection(url *netURL.URL) (redigo.Conn, error) {
+	// Then we expec the server to not ask for a password
+	if hostsNotUsingAuth.Get(url.Host) {
+		url.User = nil
+		conn, err := redisurl.ConnectToURL(url.String())
+		if err == redigoErrNoAuth {
+			hostsNotUsingAuth.Remove(url.Host)
+			return generateConnection(url)
+		}
+		return conn, err
+	}
+
+	// Then we expect the server to potentially ask for a password
+	conn, err := redisurl.ConnectToURL(url.String())
+	if err == redigoErrSentAuth {
+		hostsNotUsingAuth.Add(url.Host)
+		return generateConnection(url)
+	}
+	return conn, err
+}
+
+type Config struct {
+	MaxOpenConnections int
+	MaxIdleConnections int
+	IdleTimeout        time.Duration
+	Wait               bool
+}
+
+type PooledConnection interface {
+	Connection
+
+	Release()
+}
+
+type Pool interface {
+	Commands
+
+	GetConnection() (PooledConnection, error)
+	Return(PooledConnection)
+
+	Do(f func(Connection)) error
+	Transaction(func(Transaction)) ([]interface{}, error)
+	Pipelined(func(Pipeline)) ([]interface{}, error)
+	PipelinedDiscarding(f func(Pipeline)) error
+
+	Shutdown()
+}
+
+func NewPool(url string, config Config) (Pool, error) {
+	parsedRedisURL, err := netURL.Parse(url)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewPoolWithURL(parsedRedisURL, config), nil
+}
+
+func NewPoolWithURL(url *netURL.URL, config Config) Pool {
+	var password string
+	if url.User != nil {
+		password, _ = url.User.Password()
+	}
+
+	generator := func() (redigo.Conn, error) {
+		return generateConnection(url)
+	}
+	p := redigo.NewPool(generator, config.MaxIdleConnections)
+	p.MaxActive = config.MaxOpenConnections
+	p.IdleTimeout = config.IdleTimeout
+	p.Wait = config.Wait
+
+	return &pool{p: p, password: password}
+}
+
+type pool struct {
+	p        *redigo.Pool
+	password string
+}
+
+func (s *pool) GetConnection() (PooledConnection, error) {
+	c := s.p.Get()
+
+	// Force acquisition of an underlying connection:
+	// https://github.com/garyburd/redigo/blob/master/redis/pool.go#L138
+	if err := c.Err(); err != nil {
+		c.Close()
+		if err.Error() == "redigo: connection pool exhausted" {
+			return nil, ErrPoolExhausted
+		} else {
+			return nil, err
+		}
+	}
+
+	return &connection{pool: s, c: c, password: s.password}, nil
+}
+
+func (s *pool) Return(c PooledConnection) {
+	if c == nil {
+		return
+	}
+
+	c.Release()
+}
+
+func (s *pool) Do(f func(Connection)) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+
+	defer s.Return(c)
+
+	f(c)
+
+	return nil
+}
+
+func (s *pool) Transaction(f func(Transaction)) ([]interface{}, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+
+	defer s.Return(c)
+
+	return c.Transaction(f)
+}
+
+func (s *pool) Pipelined(f func(Pipeline)) ([]interface{}, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+
+	defer s.Return(c)
+
+	return c.Pipelined(f)
+}
+
+func (s *pool) PipelinedDiscarding(f func(Pipeline)) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+
+	defer s.Return(c)
+
+	return c.PipelinedDiscarding(f)
+}
+
+func (s *pool) Shutdown() {
+	s.p.Close()
+}
+
+// Commands - Keys
+
+func (s *pool) Del(keys ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.Del(keys...)
+}
+
+func (s *pool) Exists(key string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.Exists(key)
+}
+
+func (s *pool) Expire(key string, seconds int) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.Expire(key, seconds)
+}
+
+func (s *pool) TTL(key string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.TTL(key)
+}
+
+func (s *pool) Rename(key, newKey string) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+	defer s.Return(c)
+
+	return c.Rename(key, newKey)
+}
+
+func (s *pool) RenameNX(key, newKey string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.RenameNX(key, newKey)
+}
+
+//new
+func (s *pool) Persist(key string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.Persist(key)
+}
+
+func (s *pool) PExpire(key string, micro int64) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.PExpire(key, micro)
+}
+
+func (s *pool) PTTL(key string) (int64, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.PTTL(key)
+}
+
+
+func (s *pool) TYPE(key string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.TYPE(key)
+}
+
+func (s *pool) RandomKey() (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.RandomKey()
+}
+
+func (s *pool) Ping() (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+	return c.Ping()
+}
+// Commands - Strings
+
+func (s *pool) Get(key string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.Get(key)
+}
+
+func (s *pool) Set(key, value string) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+	defer s.Return(c)
+
+	return c.Set(key, value)
+}
+
+func (s *pool) SetEx(key, value string, expire int) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+	defer s.Return(c)
+
+	return c.SetEx(key, value, expire)
+}
+
+func (s *pool) SetNX(key, value string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.SetNX(key, value)
+}
+
+func (s *pool) Incr(key string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.Incr(key)
+}
+
+func (s *pool) Decr(key string) (int64, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+	return c.Decr(key)
+
+}
+
+func (s *pool) Append(key string, value string) (int64, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.Append(key, value)
+}
+
+func (s *pool) IncrBy(key string, value int64) (int64, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+	return c.IncrBy(key, value)
+}
+
+func (s *pool) Strlen(key string) (int64, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+	return c.Strlen(key)
+}
+
+func (s *pool) GetRange(key string, start int64, end int64) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+	return c.GetRange(key, start, end)
+}
+
+func (s *pool) MSet(fields map[string]interface{}) (string, error) {
+	if len(fields) == 0 {
+		return "", errors.New("redis: at least once field is required")
+	}
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+	return c.MSet(fields)
+}
+
+func (s *pool) MGet(fields ...string) ([]string, error) {
+	if len(fields) == 0 {
+		return nil, errors.New("redis: at least once field is required")
+	}
+
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+	return c.MGet(fields...)
+}
+
+// Commands - Hashes
+
+func (s *pool) HGet(key, field string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.HGet(key, field)
+}
+
+func (s *pool) HGetAll(key string) (map[string]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.HGetAll(key)
+}
+
+func (s *pool) HIncrBy(key, field string, value int64) (int64, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.HIncrBy(key, field, value)
+}
+
+func (s *pool) HSet(key string, field string, value string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.HSet(key, field, value)
+}
+
+func (s *pool) HMGet(key string, fields ...string) (map[string]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.HMGet(key, fields...)
+}
+
+func (s *pool) HMSet(key string, args map[string]interface{}) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+	defer s.Return(c)
+
+	return c.HMSet(key, args)
+}
+
+func (s *pool) HDel(key string, field string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.HDel(key, field)
+}
+
+/*
+	//new
+	HIncrByFloat(key string, field string, value float64) error
+	HSetNX(key string, field string, value string) error
+	HKeys(key string) error
+*/
+func (s *pool) HIncrByFloat(key string, field string, value float64) (newValue float64, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.HIncrByFloat(key, field, value)
+}
+
+func (s *pool) HSetNX(key string, field string, value string) (isSet bool, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.HSetNX(key, field, value)
+}
+
+func (s *pool) HKeys(key string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+	return c.HKeys(key)
+}
+
+
+
+// Commands - Lists
+
+func (s *pool) BLPop(timeout int, keys ...string) (string, string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", "", err
+	}
+	defer s.Return(c)
+
+	return c.BLPop(timeout, keys...)
+}
+
+func (s *pool) BRPop(timeout int, keys ...string) (string, string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", "", err
+	}
+	defer s.Return(c)
+
+	return c.BRPop(timeout, keys...)
+}
+
+func (s *pool) LIndex(key string, index int) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.LIndex(key, index)
+}
+
+func (s *pool) LLen(key string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.LLen(key)
+}
+
+func (s *pool) LPop(key string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.LPop(key)
+}
+
+func (s *pool) LPush(key string, values ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.LPush(key, values...)
+}
+
+func (s *pool) LTrim(key string, startIndex int, endIndex int) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+	defer s.Return(c)
+
+	return c.LTrim(key, startIndex, endIndex)
+}
+
+func (s *pool) LRange(key string, startIndex int, endIndex int) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.LRange(key, startIndex, endIndex)
+}
+
+func (s *pool) LRem(key string, count int, value string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.LRem(key, count, value)
+}
+
+func (s *pool) RPop(key string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.RPop(key)
+}
+
+func (s *pool) RPush(key string, values ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.RPush(key, values...)
+}
+
+func (s *pool)RPopLPush(src string, dest string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+	return c.RPopLPush(src, dest)
+}
+
+func (s *pool)LSet(key string, index int, value string) error {
+	c, err := s.GetConnection()
+	if err != nil {
+		return err
+	}
+	defer s.Return(c)
+	return c.LSet(key, index, value)
+}
+
+func (s *pool)RPushX(key string, value string) (isPushed bool, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+	return c.RPushX(key, value)
+}
+
+func (s *pool)LPushX(key string, value string) (isPushed bool, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+	return c.LPushX(key, value)
+}
+
+
+// Commands - Sets
+
+func (s *pool) SAdd(key string, member string, members ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.SAdd(key, member, members...)
+}
+
+func (s *pool) SCard(key string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.SCard(key)
+}
+
+func (s *pool) SRem(key string, member string, members ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.SRem(key, member, members...)
+}
+
+func (s *pool) SPop(key string) (string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return "", err
+	}
+	defer s.Return(c)
+
+	return c.SPop(key)
+}
+
+func (s *pool) SMembers(key string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.SMembers(key)
+}
+
+func (s *pool) SRandMember(key string, count int) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.SRandMember(key, count)
+}
+
+func (s *pool) SDiff(key string, keys ...string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.SDiff(key, keys...)
+}
+
+func (s *pool) SIsMember(key string, member string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.SIsMember(key, member)
+}
+
+func (s *pool) SMove(source, destination, member string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.SMove(source, destination, member)
+}
+
+func (s *pool) SInter(keys ...string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+	return c.SInter(keys...)
+}
+
+func (s *pool) SInterStore(dest string, keys ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+	return c.SInterStore(dest, keys...)
+}
+
+func (s *pool) SUnion(keys ...string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+	return c.SUnion(keys...)
+}
+
+func (s *pool) SUnionStore(dest string, keys ...string)(int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+	return c.SUnionStore(dest, keys...)
+}
+
+// Commands - Sorted sets
+
+func (s *pool) ZAdd(key string, args ...interface{}) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZAdd(key, args...)
+}
+
+func (s *pool) ZCard(key string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZCard(key)
+}
+
+func (s *pool) ZRange(key string, start, stop int) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRange(key, start, stop)
+}
+
+func (s *pool) ZRangeWithScores(key string, start, stop int) ([]Z, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRangeWithScores(key, start, stop)
+}
+
+func (s *pool) ZRangeByScore(key, start, stop string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRangeByScore(key, start, stop)
+}
+
+func (s *pool) ZRangeByScoreWithScores(key, start, stop string) ([]Z, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRangeByScoreWithScores(key, start, stop)
+}
+
+func (s *pool) ZRangeByScoreWithLimit(key, start, stop string, offset, count int) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRangeByScoreWithLimit(key, start, stop, offset, count)
+}
+
+func (s *pool) ZRangeByScoreWithScoresWithLimit(key, start, stop string, offset, count int) ([]Z, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRangeByScoreWithScoresWithLimit(key, start, stop, offset, count)
+}
+
+func (s *pool) ZRevRange(key string, start, stop int) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRevRange(key, start, stop)
+}
+
+func (s *pool) ZRevRangeWithScores(key string, start, stop int) ([]Z, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRevRangeWithScores(key, start, stop)
+}
+
+func (s *pool) ZRevRangeByScore(key, start, stop string) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRevRangeByScore(key, start, stop)
+}
+
+func (s *pool) ZRevRangeByScoreWithScores(key, start, stop string) ([]Z, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRevRangeByScoreWithScores(key, start, stop)
+}
+
+func (s *pool) ZRevRangeByScoreWithLimit(key, start, stop string, offset, count int) ([]string, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRevRangeByScoreWithLimit(key, start, stop, offset, count)
+}
+
+func (s *pool) ZRevRangeByScoreWithScoresWithLimit(key, start, stop string, offset, count int) ([]Z, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZRevRangeByScoreWithScoresWithLimit(key, start, stop, offset, count)
+}
+
+func (s *pool) ZRank(key, member string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZRank(key, member)
+}
+
+func (s *pool) ZRem(key string, members ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZRem(key, members...)
+}
+
+func (s *pool) ZRemRangeByRank(key string, start, stop int) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZRemRangeByRank(key, start, stop)
+}
+
+func (s *pool) ZScore(key string, member string) (score float64, err error) {
+	if member == "" {
+		return 0, nil
+	}
+
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZScore(key, member)
+}
+
+func (s *pool) ZIncrBy(key string, score float64, value string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.ZIncrBy(key, score, value)
+}
+
+func (s *pool) PFAdd(key string, values ...string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.PFAdd(key, values...)
+}
+
+func (s *pool) PFCount(key string) (int, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, err
+	}
+	defer s.Return(c)
+
+	return c.PFCount(key)
+}
+
+func (s *pool) PFMerge(mergedKey string, keysToMerge ...string) (bool, error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return false, err
+	}
+	defer s.Return(c)
+
+	return c.PFMerge(mergedKey, keysToMerge...)
+}
+
+func (s *pool) Scan(cursor int, match string, count int) (nextCursor int, matches []string, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer s.Return(c)
+
+	return c.Scan(cursor, match, count)
+}
+
+func (s *pool) SScan(key string, cursor int, match string, count int) (nextCursor int, matches []string, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer s.Return(c)
+
+	return c.SScan(key, cursor, match, count)
+}
+
+func (s *pool) ZScan(key string, cursor int, match string, count int) (nextCursor int, matches []string, scores []float64, err error) {
+	c, err := s.GetConnection()
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer s.Return(c)
+
+	return c.ZScan(key, cursor, match, count)
+}
